@@ -3,6 +3,7 @@
 批量测试食谱生成
 读取 test_menu_name.txt 中的食谱名称，调用 Ark API 生成食谱，并保存到 Excel 和 CSV
 支持中断恢复功能
+支持并发请求加速处理
 """
 import os
 import time
@@ -12,9 +13,14 @@ from dotenv import load_dotenv
 from volcenginesdkarkruntime import Ark
 import openpyxl
 from openpyxl import Workbook
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # 加载环境变量
 load_dotenv()
+
+# 创建CSV写入锁，确保多线程写入安全
+csv_lock = threading.Lock()
 
 
 def read_menu_names(file_path, limit=None):
@@ -43,24 +49,37 @@ def get_completed_menus(csv_path):
     return completed
 
 
-def save_to_csv(result, csv_path, is_new_file=False):
-    """逐条保存结果到CSV"""
+def save_to_csv(result, csv_path):
+    """逐条保存结果到CSV（线程安全）"""
     fieldnames = ['食谱名', 'AI思考过程', 'AI结果', '状态', '请求耗时(秒)']
     
-    mode = 'w' if is_new_file else 'a'
-    with open(csv_path, mode, encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with csv_lock:
+        # 检查文件是否存在，决定是否写入表头
+        file_exists = os.path.exists(csv_path)
         
-        if is_new_file:
-            writer.writeheader()
-        
-        writer.writerow({
-            '食谱名': result['menu_name'],
-            'AI思考过程': result['thinking'],
-            'AI结果': result['result'],
-            '状态': result['status'],
-            '请求耗时(秒)': result['request_time']
-        })
+        with open(csv_path, 'a', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            # 如果文件不存在或为空，写入表头
+            if not file_exists or os.path.getsize(csv_path) == 0:
+                writer.writeheader()
+            
+            writer.writerow({
+                '食谱名': result['menu_name'],
+                'AI思考过程': result['thinking'],
+                'AI结果': result['result'],
+                '状态': result['status'],
+                '请求耗时(秒)': result['request_time']
+            })
+
+
+def generate_recipe_task(client, menu_name, csv_path, excel_path):
+    """生成食谱并保存（用于并发执行）"""
+    result = generate_recipe(client, menu_name)
+    save_to_csv(result, csv_path)
+    # 立即更新 Excel 文件（静默模式，避免刷屏）
+    csv_to_excel(csv_path, excel_path, silent=True)
+    return result
 
 
 def generate_recipe(client, menu_name):
@@ -130,7 +149,7 @@ def generate_recipe(client, menu_name):
         }
 
 
-def csv_to_excel(csv_path, excel_path):
+def csv_to_excel(csv_path, excel_path, silent=False):
     """从CSV转换为Excel"""
     wb = Workbook()
     ws = wb.active
@@ -151,7 +170,8 @@ def csv_to_excel(csv_path, excel_path):
     
     # 保存文件
     wb.save(excel_path)
-    print(f"✅ Excel 文件已保存到: {excel_path}")
+    if not silent:
+        print(f"✅ Excel 文件已保存到: {excel_path}")
 
 
 def main():
@@ -167,6 +187,9 @@ def main():
     csv_file = os.path.join(output_dir, 'recipe_results.csv')
     excel_file = os.path.join(output_dir, 'recipe_results.xlsx')
     test_limit = None  # 获取全部食谱
+    
+    # 并发数量配置（可通过环境变量调整）
+    max_workers = int(os.getenv('MAX_CONCURRENT_REQUESTS', '5'))
     
     # 检查 API Key
     api_key = os.getenv('ARK_API_KEY')
@@ -195,34 +218,52 @@ def main():
         print("\n✅ 所有食谱已完成！")
         # 生成Excel文件
         if os.path.exists(csv_file):
+            print("\n正在生成 Excel 文件...")
             csv_to_excel(csv_file, excel_file)
+            
+            # 统计
+            total_completed = len(get_completed_menus(csv_file))
+            print("\n" + "=" * 70)
+            print("📊 测试统计")
+            print("=" * 70)
+            print(f"累计完成: {total_completed}")
+            print(f"\nCSV 文件: {csv_file}")
+            print(f"Excel 文件: {excel_file}")
         return
     
-    print()
+    print(f"并发数量: {max_workers}\n")
     
-    # 判断是否为首次创建CSV
-    is_new_file = not os.path.exists(csv_file) or len(completed_menus) == 0
-    
-    # 批量生成食谱
+    # 并发生成食谱
     success_count = 0
     failed_count = 0
+    completed_count = 0
     
     try:
-        for i, menu_name in enumerate(menu_names, 1):
-            print(f"[{i}/{len(menu_names)}] ", end='')
-            result = generate_recipe(client, menu_name)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_menu = {}
+            for menu_name in menu_names:
+                future = executor.submit(generate_recipe_task, client, menu_name, csv_file, excel_file)
+                future_to_menu[future] = menu_name
             
-            # 立即保存到CSV
-            save_to_csv(result, csv_file, is_new_file=(is_new_file and i == 1))
-            
-            if result['status'] == 'success':
-                success_count += 1
-            else:
-                failed_count += 1
-            
-            # 避免请求过快，适当延迟
-            if i < len(menu_names):
-                time.sleep(2)
+            # 处理完成的任务
+            for future in as_completed(future_to_menu):
+                menu_name = future_to_menu[future]
+                completed_count += 1
+                
+                try:
+                    result = future.result()
+                    
+                    if result['status'] == 'success':
+                        success_count += 1
+                    else:
+                        failed_count += 1
+                    
+                    print(f"[{completed_count}/{len(menu_names)}] 完成: {menu_name} (状态: {result['status']})")
+                    
+                except Exception as e:
+                    failed_count += 1
+                    print(f"[{completed_count}/{len(menu_names)}] ❌ 任务异常: {menu_name} - {e}")
     
     except KeyboardInterrupt:
         print("\n\n⚠️ 用户中断执行")
@@ -234,21 +275,31 @@ def main():
     
     finally:
         # 生成Excel文件
-        if os.path.exists(csv_file):
-            print("\n正在生成 Excel 文件...")
-            csv_to_excel(csv_file, excel_file)
+        try:
+            if os.path.exists(csv_file):
+                print("\n正在生成 Excel 文件...")
+                csv_to_excel(csv_file, excel_file)
+            else:
+                print("\n⚠️ CSV 文件不存在，无法生成 Excel")
+        except Exception as e:
+            print(f"\n❌ 生成 Excel 时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
         
         # 统计
-        total_completed = len(get_completed_menus(csv_file))
-        
-        print("\n" + "=" * 70)
-        print("📊 测试统计")
-        print("=" * 70)
-        print(f"本次成功: {success_count}")
-        print(f"本次失败: {failed_count}")
-        print(f"累计完成: {total_completed}")
-        print(f"\nCSV 文件: {csv_file}")
-        print(f"Excel 文件: {excel_file}")
+        try:
+            total_completed = len(get_completed_menus(csv_file))
+            
+            print("\n" + "=" * 70)
+            print("📊 测试统计")
+            print("=" * 70)
+            print(f"本次成功: {success_count}")
+            print(f"本次失败: {failed_count}")
+            print(f"累计完成: {total_completed}")
+            print(f"\nCSV 文件: {csv_file}")
+            print(f"Excel 文件: {excel_file}")
+        except Exception as e:
+            print(f"\n⚠️ 统计信息生成失败: {e}")
 
 
 if __name__ == "__main__":
